@@ -13,12 +13,12 @@ import threading
 load_dotenv()
 
 # =====================
-# CONFIG
+# CONFIG - FIXED VALUES
 # =====================
 SIMULATION = True
 POLL_INTERVAL = 10
 MAX_OPEN_TRADES = 5
-START_CAPITAL = 20.0
+START_CAPITAL = 20.0  # FIXED - NOT FROM ENV
 RISK_PCT = 0.15
 MAX_POSITION_SIZE_USD = 3.0
 MIN_ENTRY_PRICE = 0.05
@@ -63,58 +63,65 @@ CORS(app)
 DB_FILE = "trading_bot.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades
-                 (id INTEGER PRIMARY KEY, token TEXT, side TEXT, entry_price REAL, 
-                  shares REAL, entry_time TEXT, exit_price REAL, exit_time TEXT, 
-                  pnl REAL, market TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS capital_history
-                 (id INTEGER PRIMARY KEY, timestamp TEXT, capital REAL, positions_count INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS logs
-                 (id INTEGER PRIMARY KEY, timestamp TEXT, message TEXT)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS trades
+                     (id INTEGER PRIMARY KEY, token TEXT, side TEXT, entry_price REAL, 
+                      shares REAL, entry_time TEXT, exit_price REAL, exit_time TEXT, 
+                      pnl REAL, market TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS capital_history
+                     (id INTEGER PRIMARY KEY, timestamp TEXT, capital REAL, positions_count INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS logs
+                     (id INTEGER PRIMARY KEY, timestamp TEXT, message TEXT)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
 
 def save_trade(token, side, entry_price, shares, entry_time, exit_price=None, exit_time=None, pnl=0, market=""):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('INSERT INTO trades VALUES (NULL,?,?,?,?,?,?,?,?,?)',
-              (token, side, entry_price, shares, entry_time, exit_price, exit_time, pnl, market))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO trades VALUES (NULL,?,?,?,?,?,?,?,?,?)',
+                  (token, side, entry_price, shares, entry_time, exit_price, exit_time, pnl, market))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Save Trade Error: {e}")
 
 def save_capital_history(capital_val, pos_count):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    ts = datetime.now(timezone.utc).isoformat()
-    c.execute('INSERT INTO capital_history VALUES (NULL,?,?,?)', (ts, capital_val, pos_count))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        ts = datetime.now(timezone.utc).isoformat()
+        c.execute('INSERT INTO capital_history VALUES (NULL,?,?,?)', (ts, capital_val, pos_count))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Save Capital Error: {e}")
 
 def save_log(msg):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    ts = datetime.now(timezone.utc).isoformat()
-    c.execute('INSERT INTO logs VALUES (NULL,?,?)', (ts, msg))
-    conn.commit()
-    conn.close()
-
-def get_trades():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT * FROM trades ORDER BY entry_time DESC LIMIT 100')
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        ts = datetime.now(timezone.utc).isoformat()
+        c.execute('INSERT INTO logs VALUES (NULL,?,?)', (ts, msg))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Save Log Error: {e}")
 
 def get_capital_history():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT timestamp, capital FROM capital_history ORDER BY timestamp DESC LIMIT 100')
-    rows = c.fetchall()
-    conn.close()
-    return list(reversed(rows))
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT timestamp, capital FROM capital_history ORDER BY timestamp DESC LIMIT 100')
+        rows = c.fetchall()
+        conn.close()
+        return list(reversed(rows))
+    except:
+        return []
 
 # =====================
 # LOGGING
@@ -128,9 +135,6 @@ def log(msg: str):
     if len(log_messages) > 500:
         log_messages.pop(0)
     save_log(msg)
-
-def send_telegram(message: str):
-    pass
 
 # =====================
 # MARKET FETCH
@@ -386,7 +390,7 @@ def bot_loop():
            
         except Exception as e:
             error_count += 1
-            log(f"ERROR ({error_count}/5): {e}")
+            log(f"ERROR ({error_count}/5): {str(e)}")
             if error_count >= 5:
                 log("CRITICAL: Too many errors. Shutting down.")
                 bot_running = False
@@ -398,7 +402,7 @@ def bot_loop():
 # =====================
 @app.route('/')
 def dashboard():
-    html = '''<!DOCTYPE html><html><head><title>Professional Trading Bot Dashboard</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Roboto,sans-serif;background:#0f1419;color:#fff;padding:20px}html{scroll-behavior:smooth}.container{max-width:1400px;margin:0 auto}.header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:40px;border-radius:15px;margin-bottom:30px;box-shadow:0 20px 60px rgba(0,0,0,0.3)}.header h1{font-size:32px;margin-bottom:20px;font-weight:700}.controls{display:flex;gap:10px;margin-bottom:20px}.btn{padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;transition:all 0.3s}.btn-start{background:#4CAF50;color:white}.btn-start:hover{background:#45a049;transform:translateY(-2px)}.btn-stop{background:#f44336;color:white}.btn-stop:hover{background:#da190b}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-top:20px}.stat-card{background:rgba(255,255,255,0.1);padding:25px;border-radius:12px;border-left:4px solid #667eea;backdrop-filter:blur(10px)}.stat-label{font-size:12px;opacity:0.8;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.stat-value{font-size:36px;font-weight:700;margin-bottom:5px}.stat-subtext{font-size:12px;opacity:0.6}.status-badge{display:inline-block;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600}.status-running{background:#4CAF50;color:white}.status-stopped{background:#f44336;color:white}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(500px,1fr));gap:20px;margin-bottom:30px}.chart-card{background:rgba(255,255,255,0.05);padding:25px;border-radius:12px;border:1px solid rgba(255,255,255,0.1)}.chart-card h3{margin-bottom:20px;font-size:18px}.positions-table,.trades-table{background:rgba(255,255,255,0.05);border-radius:12px;padding:25px;margin-bottom:30px;border:1px solid rgba(255,255,255,0.1)}.positions-table h2,.trades-table h2{margin-bottom:20px;font-size:20px}table{width:100%;border-collapse:collapse}th{background:rgba(102,126,234,0.2);padding:15px;text-align:left;font-weight:600;border-bottom:2px solid #667eea}td{padding:15px;border-bottom:1px solid rgba(255,255,255,0.1)}tr:hover{background:rgba(102,126,234,0.1)}tbody tr:nth-child(even){background:rgba(255,255,255,0.02)}.pnl-positive{color:#4CAF50}.pnl-negative{color:#f44336}.logs{background:rgba(255,255,255,0.05);border-radius:12px;padding:25px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.1)}.log-entry{padding:10px;margin:5px 0;background:rgba(102,126,234,0.1);border-left:3px solid #667eea;border-radius:4px;font-family:monospace;font-size:12px}.no-data{text-align:center;color:#888;padding:30px}</style></head><body><div class="container"><div class="header"><div style="display:flex;justify-content:space-between;align-items:center"><div><h1>📊 Professional Trading Bot</h1><p id="status" style="margin-top:10px"><span class="status-badge status-stopped">STOPPED</span></p></div><div class="controls"><button class="btn btn-start" onclick="startBot()">▶ Start Bot</button><button class="btn btn-stop" onclick="stopBot()">⏹ Stop Bot</button></div></div><div class="stats"><div class="stat-card"><div class="stat-label">Current Capital</div><div class="stat-value" id="capital">$0.00</div><div class="stat-subtext">Initial: <span id="initial">$20.00</span></div></div><div class="stat-card"><div class="stat-label">Total P&L</div><div class="stat-value" id="pnl">$0.00</div><div class="stat-subtext">ROI: <span id="roi">0.00%</span></div></div><div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" id="open-pos">0</div><div class="stat-subtext" id="max-pos">/ 5 Maximum</div></div><div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" id="win-rate">0%</div><div class="stat-subtext" id="win-loss">0W / 0L</div></div></div></div><div class="charts"><div class="chart-card"><h3>📈 Capital Growth</h3><canvas id="capitalChart"></canvas></div><div class="chart-card"><h3>💰 P&L Distribution</h3><canvas id="pnlChart"></canvas></div></div><div class="positions-table"><h2>🔓 Open Positions</h2><table><thead><tr><th>Side</th><th>Market</th><th>Entry Price</th><th>Shares</th><th>Entry Time</th></tr></thead><tbody id="pos-tbody"><tr><td colspan="5" class="no-data">No open positions</td></tr></tbody></table></div><div class="trades-table"><h2>✅ Recent Closed Trades</h2><table><thead><tr><th>Side</th><th>Market</th><th>P&L</th><th>Status</th></tr></thead><tbody id="trades-tbody"><tr><td colspan="4" class="no-data">No closed trades yet</td></tr></tbody></table></div><div class="logs"><h3 style="margin-bottom:15px">📋 Live Logs</h3><div id="logs-container"></div></div></div><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script><script>let capitalChart,pnlChart;function updateDashboard(){fetch('/api/status').then(r=>r.json()).then(data=>{document.getElementById('capital').textContent='$'+data.capital.toFixed(2);document.getElementById('initial').textContent='$'+data.initial_capital.toFixed(2);const pnl=data.capital-data.initial_capital;document.getElementById('pnl').textContent=(pnl>=0?'+':'')+'$'+pnl.toFixed(2);const roi=(pnl/data.initial_capital)*100;document.getElementById('roi').textContent=roi.toFixed(2)+'%';document.getElementById('open-pos').textContent=data.positions_count;let statusText=data.bot_running?'<span class="status-badge status-running">RUNNING</span>':'<span class="status-badge status-stopped">STOPPED</span>';document.getElementById('status').innerHTML=statusText;let tbody=document.getElementById('pos-tbody');if(data.positions.length===0){tbody.innerHTML='<tr><td colspan="5" class="no-data">No open positions</td></tr>'}else{tbody.innerHTML=data.positions.map(p=>`<tr><td><strong>${p.side}</strong></td><td>${p.market.substring(0,50)}...</td><td>${p.entry.toFixed(4)}</td><td>${p.shares.toFixed(2)}</td><td>${new Date(p.entry_time).toLocaleString()}</td></tr>`).join('')}let tradesBody=document.getElementById('trades-tbody');if(data.closed_trades.length===0){tradesBody.innerHTML='<tr><td colspan="4" class="no-data">No closed trades yet</td></tr>'}else{tradesBody.innerHTML=data.closed_trades.slice(-20).reverse().map(t=>`<tr><td><strong>${t.side}</strong></td><td>${t.market.substring(0,50)}...</td><td class="${t.pnl>=0?'pnl-positive':'pnl-negative'}">${t.pnl>=0?'+':''}$${t.pnl.toFixed(2)}</td><td>${t.pnl>=0?'✅ Win':'❌ Loss'}</td></tr>`).join('')}updateCharts(data.capital_history);let logContainer=document.getElementById('logs-container');logContainer.innerHTML=data.logs.slice(-15).reverse().map(l=>`<div class="log-entry"><strong>${l.time.substring(11,19)}</strong> ${l.message}</div>`).join('')})}.function updateCharts(capitalHistory){const labels=capitalHistory.map(d=>new Date(d[0]).toLocaleTimeString());const data=capitalHistory.map(d=>d[1]);const ctx1=document.getElementById('capitalChart').getContext('2d');if(capitalChart)capitalChart.destroy();capitalChart=new Chart(ctx1,{type:'line',data:{labels:labels,datasets:[{label:'Capital ($)',data:data,borderColor:'#667eea',backgroundColor:'rgba(102,126,234,0.1)',tension:0.4,fill:true}]},options:{responsive:true,plugins:{legend:{display:true,labels:{color:'#fff'}}},scales:{y:{ticks:{color:'#888'},grid:{color:'rgba(255,255,255,0.1)'}},x:{ticks:{color:'#888'},grid:{color:'rgba(255,255,255,0.1)'}}}}});const ctx2=document.getElementById('pnlChart').getContext('2d');if(pnlChart)pnlChart.destroy();pnlChart=new Chart(ctx2,{type:'doughnut',data:{labels:['Wins','Losses'],datasets:[{data:[50,50],backgroundColor:['#4CAF50','#f44336']}]},options:{responsive:true,plugins:{legend:{display:true,labels:{color:'#fff'}}}}})}function startBot(){fetch('/api/start',{method:'POST'}).then(r=>r.json()).then(d=>{updateDashboard()})}function stopBot(){fetch('/api/stop',{method:'POST'}).then(r=>r.json()).then(d=>{updateDashboard()})}updateDashboard();setInterval(updateDashboard,2000);</script></body></html>'''
+    html = '''<!DOCTYPE html><html><head><title>Professional Trading Bot Dashboard</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Roboto,sans-serif;background:#0f1419;color:#fff;padding:20px}.container{max-width:1400px;margin:0 auto}.header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:40px;border-radius:15px;margin-bottom:30px;box-shadow:0 20px 60px rgba(0,0,0,0.3)}.header h1{font-size:32px;margin-bottom:20px;font-weight:700}.controls{display:flex;gap:10px;margin-bottom:20px}.btn{padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;transition:all 0.3s}.btn-start{background:#4CAF50;color:white}.btn-start:hover{background:#45a049;transform:translateY(-2px)}.btn-stop{background:#f44336;color:white}.btn-stop:hover{background:#da190b}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-top:20px}.stat-card{background:rgba(255,255,255,0.1);padding:25px;border-radius:12px;border-left:4px solid #667eea;backdrop-filter:blur(10px)}.stat-label{font-size:12px;opacity:0.8;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.stat-value{font-size:36px;font-weight:700;margin-bottom:5px}.stat-subtext{font-size:12px;opacity:0.6}.status-badge{display:inline-block;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600}.status-running{background:#4CAF50;color:white}.status-stopped{background:#f44336;color:white}.positions-table,.trades-table{background:rgba(255,255,255,0.05);border-radius:12px;padding:25px;margin-bottom:30px;border:1px solid rgba(255,255,255,0.1)}.positions-table h2,.trades-table h2{margin-bottom:20px;font-size:20px}table{width:100%;border-collapse:collapse}th{background:rgba(102,126,234,0.2);padding:15px;text-align:left;font-weight:600;border-bottom:2px solid #667eea}td{padding:15px;border-bottom:1px solid rgba(255,255,255,0.1)}tr:hover{background:rgba(102,126,234,0.1)}.pnl-positive{color:#4CAF50}.pnl-negative{color:#f44336}.logs{background:rgba(255,255,255,0.05);border-radius:12px;padding:25px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.1)}.log-entry{padding:10px;margin:5px 0;background:rgba(102,126,234,0.1);border-left:3px solid #667eea;border-radius:4px;font-family:monospace;font-size:12px}.no-data{text-align:center;color:#888;padding:30px}</style></head><body><div class="container"><div class="header"><div style="display:flex;justify-content:space-between;align-items:center"><div><h1>📊 Professional Trading Bot</h1><p id="status" style="margin-top:10px"><span class="status-badge status-stopped">STOPPED</span></p></div><div class="controls"><button class="btn btn-start" onclick="startBot()">▶ Start Bot</button><button class="btn btn-stop" onclick="stopBot()">⏹ Stop Bot</button></div></div><div class="stats"><div class="stat-card"><div class="stat-label">Current Capital</div><div class="stat-value" id="capital">$0.00</div><div class="stat-subtext">Initial: <span id="initial">$20.00</span></div></div><div class="stat-card"><div class="stat-label">Total P&L</div><div class="stat-value" id="pnl">$0.00</div><div class="stat-subtext">ROI: <span id="roi">0.00%</span></div></div><div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" id="open-pos">0</div><div class="stat-subtext" id="max-pos">/ 5 Maximum</div></div><div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" id="win-rate">0%</div><div class="stat-subtext" id="win-loss">0W / 0L</div></div></div></div><div class="positions-table"><h2>🔓 Open Positions</h2><table><thead><tr><th>Side</th><th>Market</th><th>Entry Price</th><th>Shares</th><th>Entry Time</th></tr></thead><tbody id="pos-tbody"><tr><td colspan="5" class="no-data">No open positions</td></tr></tbody></table></div><div class="trades-table"><h2>✅ Recent Closed Trades</h2><table><thead><tr><th>Side</th><th>Market</th><th>P&L</th><th>Status</th></tr></thead><tbody id="trades-tbody"><tr><td colspan="4" class="no-data">No closed trades yet</td></tr></tbody></table></div><div class="logs"><h3 style="margin-bottom:15px">📋 Live Logs</h3><div id="logs-container"></div></div></div><script>function updateDashboard(){fetch('/api/status').then(r=>r.json()).then(data=>{document.getElementById('capital').textContent='$'+data.capital.toFixed(2);document.getElementById('initial').textContent='$'+data.initial_capital.toFixed(2);const pnl=data.capital-data.initial_capital;document.getElementById('pnl').textContent=(pnl>=0?'+':'')+'$'+pnl.toFixed(2);const roi=(pnl/data.initial_capital)*100;document.getElementById('roi').textContent=roi.toFixed(2)+'%';document.getElementById('open-pos').textContent=data.positions_count;let statusText=data.bot_running?'<span class="status-badge status-running">RUNNING</span>':'<span class="status-badge status-stopped">STOPPED</span>';document.getElementById('status').innerHTML=statusText;let tbody=document.getElementById('pos-tbody');if(data.positions.length===0){tbody.innerHTML='<tr><td colspan="5" class="no-data">No open positions</td></tr>'}else{tbody.innerHTML=data.positions.map(p=>`<tr><td><strong>${p.side}</strong></td><td>${p.market.substring(0,50)}...</td><td>${p.entry.toFixed(4)}</td><td>${p.shares.toFixed(2)}</td><td>${new Date(p.entry_time).toLocaleString()}</td></tr>`).join('')}let tradesBody=document.getElementById('trades-tbody');if(data.closed_trades.length===0){tradesBody.innerHTML='<tr><td colspan="4" class="no-data">No closed trades yet</td></tr>'}else{tradesBody.innerHTML=data.closed_trades.slice(-20).reverse().map(t=>`<tr><td><strong>${t.side}</strong></td><td>${t.market.substring(0,50)}...</td><td class="${t.pnl>=0?'pnl-positive':'pnl-negative'}">${t.pnl>=0?'+':''}$${t.pnl.toFixed(2)}</td><td>${t.pnl>=0?'✅ Win':'❌ Loss'}</td></tr>`).join('')}let wins=data.closed_trades.filter(t=>t.pnl>=0).length;let losses=data.closed_trades.filter(t=>t.pnl<0).length;let rate=data.closed_trades.length>0?(wins/(wins+losses))*100:0;document.getElementById('win-rate').textContent=rate.toFixed(0)+'%';document.getElementById('win-loss').textContent=wins+'W / '+losses+'L';let logContainer=document.getElementById('logs-container');logContainer.innerHTML=data.logs.slice(-20).reverse().map(l=>`<div class="log-entry"><strong>${l.time.substring(11,19)}</strong> ${l.message}</div>`).join('')})}.function startBot(){fetch('/api/start',{method:'POST'}).then(r=>r.json()).then(d=>{updateDashboard()})}function stopBot(){fetch('/api/stop',{method:'POST'}).then(r=>r.json()).then(d=>{updateDashboard()})}updateDashboard();setInterval(updateDashboard,2000);</script></body></html>'''
     return render_template_string(html)
 
 @app.route('/api/status')
