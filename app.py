@@ -32,10 +32,10 @@ MAX_YES_ENTRY = 0.75
 MIN_NO_ENTRY = 0.25
 MAX_NO_ENTRY = 0.60
 
-# MOMENTUM
-PRICE_MOMENTUM_PCT = 0.03  # 3% momentum needed
-MOMENTUM_WINDOW = 5
-LIQUIDITY_SURGE_THRESHOLD = 30
+# MOMENTUM - RELAXED FOR REALISTIC ENTRIES
+PRICE_MOMENTUM_PCT = 0.01  # 1% momentum (was 3%, too strict)
+MOMENTUM_WINDOW = 3  # Check last 3 scans
+LIQUIDITY_SURGE_THRESHOLD = 20  # Lower threshold
 
 # PROFIT TARGETS - WIDER (10-15%)
 YES_PROFIT_TARGET = 1.10  # 10% profit
@@ -101,12 +101,15 @@ def generate_synthetic_backtest_data() -> List[Dict]:
         for m_id in range(num_markets):
             market_id = f"market_{day}_{m_id}"
             
-            # Random price movement
+            # Random price movement with momentum
             base_yes_price = random.uniform(0.40, 0.75)
             base_no_price = 1 - base_yes_price
             
-            # Add some momentum
-            momentum = random.choice([0.02, -0.02, 0, 0.03, -0.03, 0.01, -0.01])
+            # Add momentum more often (70% of time)
+            if random.random() < 0.7:
+                momentum = random.choice([0.01, -0.01, 0.02, -0.02, 0.015, -0.015])
+            else:
+                momentum = 0
             
             market = {
                 "id": market_id,
@@ -221,11 +224,12 @@ def should_buy_yes(market: Dict) -> bool:
         return False
     if not expiry_ok(market):
         return False
-    if not has_momentum(mid, "YES"):
-        return False
     
+    # Check for upward momentum OR liquidity surge
     liq_jump = last_liq.get(mid, 0) - prev_liq.get(mid, 0)
-    return liq_jump >= LIQUIDITY_SURGE_THRESHOLD or has_momentum(mid, "YES")
+    momentum = has_momentum(mid, "YES")
+    
+    return momentum or liq_jump >= LIQUIDITY_SURGE_THRESHOLD
 
 def should_buy_no(market: Dict) -> bool:
     mid = market.get("id")
@@ -235,11 +239,12 @@ def should_buy_no(market: Dict) -> bool:
         return False
     if not expiry_ok(market):
         return False
-    if not has_momentum(mid, "NO"):
-        return False
     
+    # Check for downward momentum OR liquidity surge
     liq_jump = last_liq.get(mid, 0) - prev_liq.get(mid, 0)
-    return liq_jump >= LIQUIDITY_SURGE_THRESHOLD or has_momentum(mid, "NO")
+    momentum = has_momentum(mid, "NO")
+    
+    return momentum or liq_jump >= LIQUIDITY_SURGE_THRESHOLD
 
 def buy(token: str, price: float, market: Dict, side: str):
     global capital
