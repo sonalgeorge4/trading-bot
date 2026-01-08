@@ -13,30 +13,47 @@ load_dotenv()
 
 SIMULATION = True
 POLL_INTERVAL = 10
-MAX_OPEN_TRADES = 5
+MAX_OPEN_TRADES = 20
 START_CAPITAL = float(os.getenv("START_CAPITAL", 20.0))
-RISK_PCT = 0.15
-MAX_POSITION_SIZE_USD = 3.0
-MIN_CAPITAL_BUY = 2.0
-MIN_ENTRY_PRICE = 0.05
-MIN_YES_PRICE = 0.70
-MAX_NO_PRICE = 0.30
-X_ABS_MOVE = 0.01
-EARLY_ABS_MOVE = 0.005
-TRAILING_SL_PCT = 0.05
-LIQUIDITY_MIN = 50
-LIQUIDITY_SURGE_THRESHOLD = 40
-MIN_EXPIRY_BUFFER_HIGH_CONF = 120
-MIN_EXPIRY_BUFFER_LOW_CONF = 300
+
+# AGGRESSIVE POSITION SIZING - SMALL RISK PER TRADE
+RISK_PCT = 0.03  # Only 3% per trade (was 15%)
+MAX_POSITION_SIZE_USD = 0.50  # Small positions (was 3.0)
+MIN_CAPITAL_BUY = 0.10  # Very small minimum (was 2.0)
+
+# REALISTIC PROFIT TARGETS - 2-8% expected moves
+MIN_YES_ENTRY = 0.45  # Catch momentum, not extreme prices
+MAX_YES_ENTRY = 0.75  # Don't chase 0.90+
+MIN_NO_ENTRY = 0.25
+MAX_NO_ENTRY = 0.55
+
+# MOMENTUM DETECTION - catch moves early
+PRICE_MOMENTUM_PCT = 0.02  # 2% price move (was 0.01 absolute)
+MOMENTUM_WINDOW = 3  # Check last 3 scans for momentum
+LIQUIDITY_SURGE_THRESHOLD = 30
+
+# PROFIT TARGETS - SMALL BUT CONSISTENT
+YES_PROFIT_TARGET = 1.05  # Just 5% profit (was 0.98 = 28% move)
+NO_PROFIT_TARGET = 0.95   # Just 5% profit (was 0.02 = 98% move)
+
+# STOP LOSSES - TIGHT AND IMMEDIATE
+HARD_STOP_LOSS_PCT = 0.03  # Exit immediately if -3% (was 5% trailing)
+SMART_STOP_LOSS_PCT = 0.02  # Exit if -2% with no momentum
+
+# EXPIRY AND TIMING
+MIN_EXPIRY_BUFFER = 60  # At least 1 minute (was 120-300)
+MAX_AGE_POSITION = 300  # Exit after 5 mins if no profit (was unlimited)
+
 MARKETS_PER_PAGE = 100
 NUM_PAGES = 50
 CLOBB_HOST = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
-TRADING_FEE_PCT = 0.02  # 2% maker/taker fee
+TRADING_FEE_PCT = 0.02  # 2% fee
 
 capital = START_CAPITAL
 positions = {}
-closed_trades = []  # Track all closed trades for stats
+closed_trades = []
+price_history = {}  # Track price history for momentum
 last_yes_prices = {}
 last_no_prices = {}
 prev_yes_prices = {}
@@ -60,9 +77,6 @@ def log(msg: str):
     if len(log_messages) > 500:
         log_messages.pop(0)
 
-def send_telegram(message: str):
-    pass
-
 def fetch_markets() -> List[Dict]:
     now = datetime.now(timezone.utc)
     tomorrow = now + timedelta(days=1)
@@ -75,7 +89,7 @@ def fetch_markets() -> List[Dict]:
             "closed": "false",
             "end_date_min": now.isoformat(),
             "end_date_max": tomorrow.isoformat(),
-            "liquidity_num_min": LIQUIDITY_MIN,
+            "liquidity_num_min": 20,
         }
         try:
             r = requests.get(f"{GAMMA_HOST}/markets", params=params, timeout=10)
@@ -131,6 +145,7 @@ def update_price_cache(markets: List[Dict]):
     last_yes_prices.clear()
     last_no_prices.clear()
     last_liq.clear()
+    
     for m in markets:
         mid = m.get("id")
         if not mid:
@@ -138,61 +153,97 @@ def update_price_cache(markets: List[Dict]):
         last_liq[mid] = m.get("liquidityNum", 0)
         _, y = extract_token(m, "YES")
         _, n = extract_token(m, "NO")
+        
         if y is not None:
             last_yes_prices[mid] = y
+            # Track price history
+            if mid not in price_history:
+                price_history[mid] = {"yes": [], "no": []}
+            price_history[mid]["yes"].append(y)
+            if len(price_history[mid]["yes"]) > MOMENTUM_WINDOW:
+                price_history[mid]["yes"].pop(0)
+        
         if n is not None:
             last_no_prices[mid] = n
+            if mid not in price_history:
+                price_history[mid] = {"yes": [], "no": []}
+            price_history[mid]["no"].append(n)
+            if len(price_history[mid]["no"]) > MOMENTUM_WINDOW:
+                price_history[mid]["no"].pop(0)
 
-def expiry_ok(market: Dict, price: float) -> bool:
+def has_momentum(mid: str, side: str) -> bool:
+    """Check if price is moving in favorable direction"""
+    if mid not in price_history:
+        return False
+    
+    history = price_history[mid][side.lower()]
+    if len(history) < 2:
+        return False
+    
+    oldest = history[0]
+    newest = history[-1]
+    pct_change = abs((newest - oldest) / oldest) if oldest != 0 else 0
+    
+    if side == "YES":
+        return (newest - oldest) > 0 and pct_change >= PRICE_MOMENTUM_PCT
+    else:  # NO
+        return (oldest - newest) > 0 and pct_change >= PRICE_MOMENTUM_PCT
+
+def expiry_ok(market: Dict) -> bool:
     try:
         end = datetime.fromisoformat(market["endDate"].replace("Z", "+00:00"))
         remaining = (end - datetime.now(timezone.utc)).total_seconds()
-        buf = MIN_EXPIRY_BUFFER_HIGH_CONF if price > 0.9 else MIN_EXPIRY_BUFFER_LOW_CONF
-        return remaining >= buf
+        return remaining >= MIN_EXPIRY_BUFFER
     except:
         return False
 
 def should_buy_yes(market: Dict) -> bool:
+    """Buy YES when it's in middle range with upward momentum"""
     mid = market.get("id")
     _, price = extract_token(market, "YES")
-    if price is None or price < MIN_YES_PRICE:
+    
+    if price is None:
         return False
-    if not expiry_ok(market, price):
+    if price < MIN_YES_ENTRY or price > MAX_YES_ENTRY:
         return False
-    prev = prev_yes_prices.get(mid)
+    if not expiry_ok(market):
+        return False
+    
+    # Check for upward momentum
+    if not has_momentum(mid, "YES"):
+        return False
+    
+    # Also consider liquidity jumps as entry signal
     liq_jump = last_liq.get(mid, 0) - prev_liq.get(mid, 0)
-    if prev is None:
-        return liq_jump >= LIQUIDITY_SURGE_THRESHOLD
-    return (
-        price - prev >= X_ABS_MOVE or
-        (prev > 0.85 and price - prev >= EARLY_ABS_MOVE) or
-        liq_jump >= LIQUIDITY_SURGE_THRESHOLD
-    )
+    return liq_jump >= LIQUIDITY_SURGE_THRESHOLD or has_momentum(mid, "YES")
 
 def should_buy_no(market: Dict) -> bool:
+    """Buy NO when it's in middle range with downward momentum"""
     mid = market.get("id")
     _, price = extract_token(market, "NO")
-    if price is None or price > MAX_NO_PRICE:
+    
+    if price is None:
         return False
-    if not expiry_ok(market, price):
+    if price < MIN_NO_ENTRY or price > MAX_NO_ENTRY:
         return False
-    prev = prev_no_prices.get(mid)
+    if not expiry_ok(market):
+        return False
+    
+    # Check for downward momentum
+    if not has_momentum(mid, "NO"):
+        return False
+    
+    # Also consider liquidity jumps as entry signal
     liq_jump = last_liq.get(mid, 0) - prev_liq.get(mid, 0)
-    if prev is None:
-        return liq_jump >= LIQUIDITY_SURGE_THRESHOLD
-    return (
-        prev - price >= X_ABS_MOVE or
-        (prev < 0.15 and prev - price >= EARLY_ABS_MOVE) or
-        liq_jump >= LIQUIDITY_SURGE_THRESHOLD
-    )
+    return liq_jump >= LIQUIDITY_SURGE_THRESHOLD or has_momentum(mid, "NO")
 
 def buy(token: str, price: float, market: Dict, side: str):
     global capital
+    
     stake = min(capital * RISK_PCT, MAX_POSITION_SIZE_USD)
-    if stake < 1 or capital < stake:
+    if stake < MIN_CAPITAL_BUY or capital < stake:
         return
     
-    # Calculate shares and include entry fee
     shares = stake / price
     entry_fee = stake * TRADING_FEE_PCT
     total_cost = stake + entry_fee
@@ -212,37 +263,22 @@ def buy(token: str, price: float, market: Dict, side: str):
         "entry_fee": entry_fee,
         "high": price,
         "low": price,
+        "last_checked": datetime.now(timezone.utc).isoformat(),
     }
     positions[token] = pos
-    msg = f"BUY {side} {market.get('question', 'Unknown')[:45]} @ {price:.3f} | Shares: {shares:.2f} | Cost: ${stake:.2f} + ${entry_fee:.2f} fee | Capital: ${capital:.2f}"
+    msg = f"BUY {side} {market.get('question', 'Unknown')[:40]} @ {price:.4f} | Stake: ${stake:.2f} | Capital: ${capital:.2f}"
     log(msg)
 
-def get_price_for_token(token: str, side: str) -> Optional[float]:
-    """Get current price for a specific token"""
-    try:
-        r = requests.get(f"{CLOBB_HOST}/price?token_id={token}", timeout=5).json()
-        bid = float(r.get("bid", 0))
-        ask = float(r.get("ask", 0))
-        if bid and ask:
-            return (bid + ask) / 2
-        return None
-    except:
-        return None
-
 def check_exit(token: str, pos: Dict, markets_dict: Dict):
-    """Check and execute exit conditions with proper fee calculation"""
+    """Check and execute exit with smart stop losses"""
     global capital
     
-    # Get current price - first try from markets_dict, then API
     market_id = pos.get("market_id")
     price = None
     
     if market_id and market_id in markets_dict:
         market = markets_dict[market_id]
         _, price = extract_token(market, pos["side"])
-    
-    if price is None:
-        price = get_price_for_token(token, pos["side"])
     
     if price is None:
         return
@@ -252,29 +288,44 @@ def check_exit(token: str, pos: Dict, markets_dict: Dict):
     side = pos.get("side", "YES")
     entry_cost = pos.get("entry_cost", shares * entry)
     entry_fee = pos.get("entry_fee", 0)
+    total_invested = entry_cost + entry_fee
+    
+    entry_time = datetime.fromisoformat(pos["entry_time"])
+    position_age = (datetime.now(timezone.utc) - entry_time).total_seconds()
     
     exit_price = None
     exit_reason = None
     
-    # TAKE PROFIT LOGIC
-    if side == "YES" and price >= 0.98:
+    # PROFIT TARGET - Small but consistent
+    if side == "YES" and price >= entry * YES_PROFIT_TARGET:
         exit_price = price
-        exit_reason = "TP_YES"
-    elif side == "NO" and price <= 0.02:
+        exit_reason = "PROFIT_TARGET"
+    elif side == "NO" and price <= entry * NO_PROFIT_TARGET:
         exit_price = price
-        exit_reason = "TP_NO"
+        exit_reason = "PROFIT_TARGET"
     
-    # TRAILING STOP LOSS LOGIC
-    elif side == "YES":
-        pos["high"] = max(pos["high"], price)
-        if price < pos["high"] * (1 - TRAILING_SL_PCT):
+    # HARD STOP LOSS - Immediate exit if -3%
+    elif side == "YES" and price <= entry * (1 - HARD_STOP_LOSS_PCT):
+        exit_price = price
+        exit_reason = "HARD_SL"
+    elif side == "NO" and price >= entry * (1 + HARD_STOP_LOSS_PCT):
+        exit_price = price
+        exit_reason = "HARD_SL"
+    
+    # SMART STOP LOSS - Exit if -2% AND no momentum
+    elif side == "YES" and price <= entry * (1 - SMART_STOP_LOSS_PCT):
+        if not has_momentum(market_id, "YES"):
             exit_price = price
-            exit_reason = "SL_YES"
-    else:  # NO
-        pos["low"] = min(pos["low"], price)
-        if price > pos["low"] * (1 + TRAILING_SL_PCT):
+            exit_reason = "SMART_SL_NO_MOMENTUM"
+    elif side == "NO" and price >= entry * (1 + SMART_STOP_LOSS_PCT):
+        if not has_momentum(market_id, "NO"):
             exit_price = price
-            exit_reason = "SL_NO"
+            exit_reason = "SMART_SL_NO_MOMENTUM"
+    
+    # TIME DECAY - Exit after 5 mins regardless if underwater
+    elif position_age > MAX_AGE_POSITION:
+        exit_price = price
+        exit_reason = "TIME_DECAY"
     
     # EXECUTE EXIT
     if exit_price is not None:
@@ -283,73 +334,77 @@ def check_exit(token: str, pos: Dict, markets_dict: Dict):
         net_proceeds = proceeds - exit_fee
         
         gross_pnl = proceeds - entry_cost
-        net_pnl = net_proceeds - entry_cost - entry_fee
-        pnl_pct = (net_pnl / (entry_cost + entry_fee)) * 100 if (entry_cost + entry_fee) > 0 else 0
+        net_pnl = net_proceeds - total_invested
+        pnl_pct = (net_pnl / total_invested) * 100 if total_invested > 0 else 0
         
         capital += net_proceeds
         
-        # Log closed trade
         closed_trades.append({
             "market": pos["market"],
             "side": side,
             "entry_price": entry,
             "exit_price": exit_price,
             "shares": shares,
-            "entry_cost": entry_cost,
-            "entry_fee": entry_fee,
-            "exit_proceeds": proceeds,
-            "exit_fee": exit_fee,
             "gross_pnl": gross_pnl,
             "net_pnl": net_pnl,
             "pnl_pct": pnl_pct,
             "exit_reason": exit_reason,
-            "entry_time": pos["entry_time"],
+            "position_age": position_age,
             "exit_time": datetime.now(timezone.utc).isoformat(),
         })
         
         del positions[token]
         
-        msg = f"EXIT {side} ({exit_reason}) @ {exit_price:.3f} | Gross PnL: ${gross_pnl:.2f} | Net PnL: ${net_pnl:.2f} ({pnl_pct:.1f}%) | Fees: ${entry_fee + exit_fee:.2f} | Capital: ${capital:.2f}"
+        msg = f"EXIT {side} ({exit_reason}) @ {exit_price:.4f} | Net PnL: ${net_pnl:.3f} ({pnl_pct:.2f}%) | Capital: ${capital:.2f}"
         log(msg)
 
 def bot_loop():
     global capital, error_count, bot_running
-    log(f"BOT STARTED | Capital ${capital:.2f}")
+    log(f"BOT STARTED | Capital ${capital:.2f} | Risk per trade: {RISK_PCT*100}% | Target: {(YES_PROFIT_TARGET-1)*100:.1f}%")
     bot_running = True
+    
     while bot_running:
         try:
             markets = fetch_markets()
-            log(f"Fetched {len(markets)} markets")
             
-            # Create market dict for quick lookup
             markets_dict = {m.get("id"): m for m in markets if m.get("id")}
-            
             update_price_cache(markets)
             
-            # Check exits BEFORE new entries
+            # EXIT FIRST
             for t, p in list(positions.items()):
                 check_exit(t, p, markets_dict)
             
-            # New entries
+            # NEW ENTRIES
             for m in markets:
                 if len(positions) >= MAX_OPEN_TRADES:
                     break
+                
                 mid = m.get("id")
                 if not mid:
                     continue
+                
                 ytok, yprice = extract_token(m, "YES")
                 ntok, nprice = extract_token(m, "NO")
                 
-                if len(positions) < MAX_OPEN_TRADES and ytok and ytok not in positions and should_buy_yes(m):
+                if ytok and ytok not in positions and should_buy_yes(m):
                     buy(ytok, yprice, m, "YES")
                     continue
-                if len(positions) < MAX_OPEN_TRADES and ntok and ntok not in positions and should_buy_no(m):
+                
+                if ntok and ntok not in positions and should_buy_no(m):
                     buy(ntok, nprice, m, "NO")
             
-            total_pnl = sum(t.get("net_pnl", 0) for t in closed_trades)
-            win_rate = len([t for t in closed_trades if t.get("net_pnl", 0) > 0]) / len(closed_trades) * 100 if closed_trades else 0
+            # STATS
+            if closed_trades:
+                total_pnl = sum(t.get("net_pnl", 0) for t in closed_trades)
+                winners = len([t for t in closed_trades if t.get("net_pnl", 0) > 0])
+                win_rate = (winners / len(closed_trades)) * 100
+                avg_win = sum(t.get("net_pnl", 0) for t in closed_trades if t.get("net_pnl", 0) > 0) / winners if winners > 0 else 0
+                avg_loss = sum(t.get("net_pnl", 0) for t in closed_trades if t.get("net_pnl", 0) <= 0) / (len(closed_trades) - winners) if (len(closed_trades) - winners) > 0 else 0
+                
+                log(f"SCAN | Open: {len(positions)}/{MAX_OPEN_TRADES} | Closed: {len(closed_trades)} | PnL: ${total_pnl:.2f} | WR: {win_rate:.1f}% | Avg W: ${avg_win:.3f} | Avg L: ${avg_loss:.3f} | Capital: ${capital:.2f}")
+            else:
+                log(f"SCAN | Open: {len(positions)}/{MAX_OPEN_TRADES} | Capital: ${capital:.2f}")
             
-            log(f"SCAN DONE | Open {len(positions)}/{MAX_OPEN_TRADES} | Closed {len(closed_trades)} | Total PnL ${total_pnl:.2f} | Win Rate {win_rate:.1f}% | Capital ${capital:.2f}")
             error_count = 0
             time.sleep(POLL_INTERVAL)
            
@@ -364,13 +419,21 @@ def bot_loop():
 
 @app.route('/')
 def dashboard():
-    html = '''<!DOCTYPE html><html><head><title>Trading Bot Dashboard</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>* { margin: 0; padding: 0; box-sizing: border-box; } body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; } .container { max-width: 1400px; margin: 0 auto; } .header { background: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); } .header h1 { color: #333; margin-bottom: 10px; } .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-top: 20px; } .stat-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; } .stat-label { font-size: 12px; opacity: 0.9; margin-bottom: 10px; } .stat-value { font-size: 28px; font-weight: bold; } .positions, .logs, .trades { background: white; border-radius: 10px; padding: 30px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); } .positions h2, .logs h2, .trades h2 { color: #333; margin-bottom: 20px; border-bottom: 2px solid #667eea; padding-bottom: 10px; } table { width: 100%; border-collapse: collapse; } th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; } th { background: #f5f5f5; font-weight: 600; color: #333; } .log-entry { padding: 10px; margin: 5px 0; background: #f9f9f9; border-left: 4px solid #667eea; font-family: monospace; font-size: 11px; } .control-btn { background: #667eea; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; } .control-btn:hover { background: #764ba2; } .control-btn.stop { background: #e74c3c; } .control-btn.stop:hover { background: #c0392b; } .no-data { text-align: center; color: #999; padding: 20px; } .status { display: inline-block; padding: 5px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; } .status.running { background: #2ecc71; color: white; } .status.stopped { background: #e74c3c; color: white; } .pnl-positive { color: #2ecc71; font-weight: bold; } .pnl-negative { color: #e74c3c; font-weight: bold; }</style></head><body><div class="container"><div class="header"><div style="display: flex; justify-content: space-between; align-items: center;"><div><h1>🤖 Trading Bot Dashboard</h1><p id="status" style="color: #666; margin-top: 5px;"><span class="status stopped">STOPPED</span></p></div><div><button class="control-btn" onclick="startBot()">Start Bot</button><button class="control-btn stop" onclick="stopBot()">Stop Bot</button></div></div><div class="stats"><div class="stat-box"><div class="stat-label">CAPITAL</div><div class="stat-value" id="capital">$0.00</div></div><div class="stat-box"><div class="stat-label">OPEN POSITIONS</div><div class="stat-value" id="open-pos">0</div></div><div class="stat-box"><div class="stat-label">CLOSED TRADES</div><div class="stat-value" id="closed-trades">0</div></div><div class="stat-box"><div class="stat-label">TOTAL PnL</div><div class="stat-value" id="total-pnl">$0.00</div></div><div class="stat-box"><div class="stat-label">WIN RATE</div><div class="stat-value" id="win-rate">0%</div></div><div class="stat-box"><div class="stat-label">ERRORS</div><div class="stat-value" id="errors">0</div></div></div></div><div class="positions"><h2>Open Positions</h2><table><thead><tr><th>Side</th><th>Market</th><th>Entry Price</th><th>Shares</th><th>Entry Time</th></tr></thead><tbody id="pos-tbody"><tr><td colspan="5" class="no-data">No open positions</td></tr></tbody></table></div><div class="trades"><h2>Closed Trades (Last 10)</h2><table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>Shares</th><th>Gross PnL</th><th>Net PnL</th><th>Win %</th><th>Reason</th><th>Exit Time</th></tr></thead><tbody id="trades-tbody"><tr><td colspan="10" class="no-data">No closed trades</td></tr></tbody></table></div><div class="logs"><h2>Recent Logs</h2><div id="logs-container" style="max-height: 400px; overflow-y: auto;"></div></div></div><script>function updateDashboard() { fetch('/api/status').then(r => r.json()).then(data => { document.getElementById('capital').textContent = '$' + data.capital.toFixed(2); document.getElementById('open-pos').textContent = data.positions_count; document.getElementById('closed-trades').textContent = data.closed_trades_count; document.getElementById('errors').textContent = data.error_count; document.getElementById('total-pnl').textContent = '$' + data.total_pnl.toFixed(2); document.getElementById('win-rate').textContent = data.win_rate.toFixed(1) + '%'; let statusText = data.bot_running ? '<span class="status running">RUNNING</span>' : '<span class="status stopped">STOPPED</span>'; document.getElementById('status').innerHTML = statusText; let tbody = document.getElementById('pos-tbody'); if (data.positions.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="no-data">No open positions</td></tr>'; } else { tbody.innerHTML = data.positions.map(p => `<tr><td><strong>${p.side}</strong></td><td>${p.market.substring(0, 40)}...</td><td>${p.entry.toFixed(4)}</td><td>${p.shares.toFixed(2)}</td><td>${new Date(p.entry_time).toLocaleString()}</td></tr>`).join(''); } let tradesHtml = data.closed_trades.slice(-10).reverse().map(t => { let pnlClass = t.net_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'; return `<tr><td>${t.market.substring(0,30)}...</td><td><strong>${t.side}</strong></td><td>${t.entry_price.toFixed(4)}</td><td>${t.exit_price.toFixed(4)}</td><td>${t.shares.toFixed(2)}</td><td>${t.gross_pnl >= 0 ? '+' : ''}$${t.gross_pnl.toFixed(2)}</td><td class="${pnlClass}">${t.net_pnl >= 0 ? '+' : ''}$${t.net_pnl.toFixed(2)}</td><td>${t.pnl_pct.toFixed(1)}%</td><td>${t.exit_reason}</td><td>${new Date(t.exit_time).toLocaleTimeString()}</td></tr>`; }).join(''); let tradesBody = document.getElementById('trades-tbody'); tradesBody.innerHTML = tradesHtml || '<tr><td colspan="10" class="no-data">No closed trades</td></tr>'; let logContainer = document.getElementById('logs-container'); logContainer.innerHTML = data.logs.slice(-20).reverse().map(l => `<div class="log-entry"><strong>${l.time.substring(11, 19)}</strong> ${l.message}</div>`).join(''); }); } function startBot() { fetch('/api/start', {method: 'POST'}).then(r => r.json()).then(data => { updateDashboard(); }); } function stopBot() { fetch('/api/stop', {method: 'POST'}).then(r => r.json()).then(data => { updateDashboard(); }); } updateDashboard(); setInterval(updateDashboard, 2000);</script></body></html>'''
+    html = '''<!DOCTYPE html><html><head><title>Trading Bot Dashboard</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>* { margin: 0; padding: 0; box-sizing: border-box; } body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; } .container { max-width: 1400px; margin: 0 auto; } .header { background: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); } .header h1 { color: #333; margin-bottom: 10px; } .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-top: 20px; } .stat-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px; text-align: center; } .stat-label { font-size: 11px; opacity: 0.9; margin-bottom: 8px; text-transform: uppercase; } .stat-value { font-size: 24px; font-weight: bold; } .positions, .logs, .trades { background: white; border-radius: 10px; padding: 25px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); } h2 { color: #333; margin-bottom: 15px; border-bottom: 2px solid #667eea; padding-bottom: 10px; } table { width: 100%; border-collapse: collapse; } th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 12px; } th { background: #f5f5f5; font-weight: 600; } .log-entry { padding: 8px; margin: 4px 0; background: #f9f9f9; border-left: 3px solid #667eea; font-family: monospace; font-size: 11px; } .control-btn { background: #667eea; color: white; padding: 8px 16px; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; margin-right: 8px; } .control-btn:hover { background: #764ba2; } .control-btn.stop { background: #e74c3c; } .control-btn.stop:hover { background: #c0392b; } .status { display: inline-block; padding: 4px 8px; border-radius: 20px; font-size: 11px; font-weight: bold; } .status.running { background: #2ecc71; color: white; } .status.stopped { background: #e74c3c; color: white; } .pnl-positive { color: #2ecc71; font-weight: bold; } .pnl-negative { color: #e74c3c; font-weight: bold; }</style></head><body><div class="container"><div class="header"><div style="display: flex; justify-content: space-between; align-items: center;"><div><h1>🤖 Trading Bot v2 (Low Risk Strategy)</h1><p id="status" style="color: #666; margin-top: 5px;"><span class="status stopped">STOPPED</span></p></div><div><button class="control-btn" onclick="startBot()">Start</button><button class="control-btn stop" onclick="stopBot()">Stop</button></div></div><div class="stats"><div class="stat-box"><div class="stat-label">Capital</div><div class="stat-value" id="capital">$0.00</div></div><div class="stat-box"><div class="stat-label">Open</div><div class="stat-value" id="open-pos">0</div></div><div class="stat-box"><div class="stat-label">Closed</div><div class="stat-value" id="closed-trades">0</div></div><div class="stat-box"><div class="stat-label">Total PnL</div><div class="stat-value" id="total-pnl">$0.00</div></div><div class="stat-box"><div class="stat-label">Win Rate</div><div class="stat-value" id="win-rate">0%</div></div><div class="stat-box"><div class="stat-label">Profit Factor</div><div class="stat-value" id="profit-factor">0x</div></div></div></div><div class="positions"><h2>Open Positions</h2><table><thead><tr><th>Side</th><th>Market</th><th>Entry</th><th>Shares</th><th>Entry Time</th></tr></thead><tbody id="pos-tbody"><tr><td colspan="5" style="text-align: center; color: #999;">No open positions</td></tr></tbody></table></div><div class="trades"><h2>Recent Closed Trades</h2><table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL $</th><th>PnL %</th><th>Reason</th><th>Age</th></tr></thead><tbody id="trades-tbody"><tr><td colspan="8" style="text-align: center; color: #999;">No closed trades</td></tr></tbody></table></div><div class="logs"><h2>Logs</h2><div id="logs-container" style="max-height: 500px; overflow-y: auto;"></div></div></div><script>function updateDashboard() { fetch('/api/status').then(r => r.json()).then(data => { document.getElementById('capital').textContent = '$' + data.capital.toFixed(2); document.getElementById('open-pos').textContent = data.positions_count; document.getElementById('closed-trades').textContent = data.closed_trades_count; let totalPnl = data.total_pnl || 0; document.getElementById('total-pnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2); document.getElementById('win-rate').textContent = data.win_rate.toFixed(1) + '%'; document.getElementById('profit-factor').textContent = (data.profit_factor || 0).toFixed(2) + 'x'; let statusText = data.bot_running ? '<span class="status running">RUNNING</span>' : '<span class="status stopped">STOPPED</span>'; document.getElementById('status').innerHTML = statusText; let tbody = document.getElementById('pos-tbody'); if (!data.positions || data.positions.length === 0) { tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #999;">No open positions</td></tr>'; } else { tbody.innerHTML = data.positions.map(p => `<tr><td><strong>${p.side}</strong></td><td>${p.market.substring(0, 35)}</td><td>${p.entry.toFixed(4)}</td><td>${p.shares.toFixed(1)}</td><td>${new Date(p.entry_time).toLocaleTimeString()}</td></tr>`).join(''); } let tradesHtml = ''; if (data.closed_trades && data.closed_trades.length > 0) { tradesHtml = data.closed_trades.slice(-15).reverse().map(t => { let pnlClass = t.net_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'; let ageMin = Math.round(t.position_age / 60); return `<tr><td>${t.market.substring(0, 25)}</td><td><strong>${t.side}</strong></td><td>${t.entry_price.toFixed(4)}</td><td>${t.exit_price.toFixed(4)}</td><td class="${pnlClass}">${t.net_pnl >= 0 ? '+' : ''}$${t.net_pnl.toFixed(3)}</td><td class="${pnlClass}">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(2)}%</td><td>${t.exit_reason}</td><td>${ageMin}m</td></tr>`; }).join(''); } let tradesBody = document.getElementById('trades-tbody'); tradesBody.innerHTML = tradesHtml || '<tr><td colspan="8" style="text-align: center; color: #999;">No closed trades</td></tr>'; let logContainer = document.getElementById('logs-container'); logContainer.innerHTML = data.logs.slice(-30).reverse().map(l => `<div class="log-entry"><strong>${l.time.substring(11, 19)}</strong> ${l.message}</div>`).join(''); }); } function startBot() { fetch('/api/start', {method: 'POST'}).then(() => updateDashboard()); } function stopBot() { fetch('/api/stop', {method: 'POST'}).then(() => updateDashboard()); } updateDashboard(); setInterval(updateDashboard, 2000);</script></body></html>'''
     return render_template_string(html)
 
 @app.route('/api/status')
 def get_status():
     total_pnl = sum(t.get("net_pnl", 0) for t in closed_trades)
-    win_rate = len([t for t in closed_trades if t.get("net_pnl", 0) > 0]) / len(closed_trades) * 100 if closed_trades else 0
+    
+    if closed_trades:
+        win_rate = len([t for t in closed_trades if t.get("net_pnl", 0) > 0]) / len(closed_trades) * 100
+        gains = sum(t.get("net_pnl", 0) for t in closed_trades if t.get("net_pnl", 0) > 0)
+        losses = abs(sum(t.get("net_pnl", 0) for t in closed_trades if t.get("net_pnl", 0) < 0))
+        profit_factor = gains / losses if losses > 0 else gains
+    else:
+        win_rate = 0
+        profit_factor = 0
     
     return jsonify({
         "capital": capital,
@@ -380,6 +443,7 @@ def get_status():
         "closed_trades": closed_trades,
         "total_pnl": total_pnl,
         "win_rate": win_rate,
+        "profit_factor": profit_factor,
         "error_count": error_count,
         "bot_running": bot_running,
         "logs": log_messages
